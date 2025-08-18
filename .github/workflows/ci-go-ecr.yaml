@@ -9,11 +9,12 @@ name: CI on ECR
 jobs:
   deploy:
     name: Deploy
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+
         # AWS 접근 인증
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
@@ -22,9 +23,11 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-northeast-2
+
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+
       - name: Build, tag, and push the image to Amazon ECR
         run: |
           # Get current UTC time as image tag  - > 이미지 태그 생성용 변수
@@ -39,3 +42,11 @@ jobs:
         env:
           AWS_DEFAULT_REGION: ap-northeast-2
           AWS_REGION: ap-northeast-2
+
+      - name: Verify manifest
+        run: |
+          aws ecr batch-get-image \
+            --repository-name ${{ secrets.REPOSITORY_NAME }} \
+            --image-ids imageTag=${{ env.IMAGE_TAG }} \
+            --query 'images[].imageManifest' --output text \
+          | jq -r '.manifests[0].platform.architecture'
