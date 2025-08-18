@@ -1,52 +1,104 @@
+name: CI on ECR
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
-name: CI on ECR
+env:
+  AWS_REGION: ap-northeast-2
+  REPOSITORY_PREFIX: backend-service
 
 jobs:
-  deploy:
-    name: Deploy
+  detect-changed:
     runs-on: ubuntu-24.04-arm
-
+    outputs:
+      folders: ${{ steps.collect.outputs.folders }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-        # AWS 접근 인증
+      - name: Collect changed top-level folders
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before }}"
+          HEAD_SHA="${{ github.sha }}"
+          git fetch --no-tags --depth=100 origin ${{ github.ref }} || true
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || true)
+
+          ROOTS=$(printf "%s\n" "$CHANGED" \
+            | awk -F/ 'NF>=2 {print $1}' \
+            | grep -Ev '^\.(git|github|vscode)$' \
+            | sort -u || true)
+
+          FILTERED=()
+          for f in $ROOTS; do
+            [ -f "$f/Dockerfile" ] && FILTERED+=("$f")
+          done
+
+          if [ ${#FILTERED[@]} -eq 0 ]; then
+            JSON="[]"
+          else
+            JSON=$(printf '%s\n' "${FILTERED[@]}" | jq -R -s -c 'split("\n")|map(select(length>0))')
+          fi
+          echo "folders=$JSON" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: detect-changed
+    if: ${{ needs.detect-changed.outputs.folders != '[]' }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect-changed.outputs.folders) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          # IAM AWS ACCESS
+          aws-region: ${{ env.AWS_REGION }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-northeast-2
 
       - name: Login to Amazon ECR
-        id: login-ecr
+        id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push the image to Amazon ECR
-        run: |
-          # Get current UTC time as image tag  - > 이미지 태그 생성용 변수
-          IMAGE_TAG=$(date -u +"%Y%m%dT%H%M%SZ")
-          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
-
-          # Build a Docker container and push it to ECR  
-          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ secrets.REPOSITORY_NAME }}:$IMAGE_TAG .
-          echo "Pushing image to ECR..."
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.REPOSITORY_NAME }}:$IMAGE_TAG
-          echo "::set-output name=image::${{ steps.login-ecr.outputs.registry }}/${{ secrets.REPOSITORY_NAME }}:$IMAGE_TAG"
+      - name: Ensure ECR repo exists (backend-service/<folder>)
         env:
-          AWS_DEFAULT_REGION: ap-northeast-2
-          AWS_REGION: ap-northeast-2
+          REPO: ${{ env.REPOSITORY_PREFIX }}/${{ matrix.service }}
+        run: |
+          set -e
+          aws ecr describe-repositories --repository-names "$REPO" --region ${{ env.AWS_REGION }} >/dev/null 2>&1 \
+          || aws ecr create-repository --repository-name "$REPO" --region ${{ env.AWS_REGION }}
 
-      - name: Verify manifest
+      - name: Set timestamp tag
+        id: tag
+        run: echo "ts=$(date -u +'%Y%m%dT%H%M%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build & Push (prefix + folder)
+        env:
+          REPO: ${{ env.REPOSITORY_PREFIX }}/${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          file: ./${{ matrix.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.REPO }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ env.REPO }}:${{ steps.tag.outputs.ts }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify pushed image (optional)
+        env:
+          REPO: ${{ env.REPOSITORY_PREFIX }}/${{ matrix.service }}
         run: |
           aws ecr batch-get-image \
-            --repository-name ${{ secrets.REPOSITORY_NAME }} \
-            --image-ids imageTag=${{ env.IMAGE_TAG }} \
-            --query 'images[].imageManifest' --output text \
-          | jq -r '.manifests[0].platform.architecture'
+            --repository-name "$REPO" \
+            --image-ids imageTag=${{ steps.tag.outputs.ts }} \
+            --query 'images[].imageId.imageTag' --output text
