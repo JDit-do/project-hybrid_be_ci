@@ -38,9 +38,10 @@ jobs:
           IMAGE_TAG=$(date -u +"%Y%m%dT%H%M%SZ")
           echo "IMAGE_TAG=${IMAGE_TAG}"
 
-          # 레포 루트의 1-depth 폴더들 중 Dockerfile 있는 것만 대상
+          # 레포 루트의 1-depth 폴더 수집
           mapfile -t FOLDERS < <(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n' \
                                   | grep -Ev '^\.(git|github|vscode)$' || true)
+          echo "Top-level dirs: ${FOLDERS[*]:-<none>}"
 
           if [ ${#FOLDERS[@]} -eq 0 ]; then
             echo "No top-level folders found. Nothing to do."
@@ -48,27 +49,26 @@ jobs:
           fi
 
           for dir in "${FOLDERS[@]}"; do
-            if [ ! -f "$dir/Dockerfile" ]; then
-              echo "Skip $dir (no Dockerfile)"
+            # Dockerfile 경로 탐색 (대/소문자 모두 허용)
+            if   [ -f "$dir/Dockerfile" ]; then DOCKERFILE="$dir/Dockerfile"
+            elif [ -f "$dir/dockerfile" ]; then DOCKERFILE="$dir/dockerfile"
+            else
+              echo "Skip $dir (no Dockerfile/dockerfile)"
               continue
             fi
 
-            # ECR 리포 이름: backend-service-<폴더명>
             repo_name="${REPO_PREFIX}-${dir}"
-
-            echo "=== Building folder: $dir -> ECR repo: ${repo_name}"
+            echo "=== Building folder: $dir (Dockerfile: $DOCKERFILE) -> ECR repo: ${repo_name}"
 
             # 리포 없으면 생성
             aws ecr describe-repositories --repository-names "${repo_name}" --region "${AWS_REGION}" >/dev/null 2>&1 \
               || aws ecr create-repository --repository-name "${repo_name}" --region "${AWS_REGION}"
 
-            # 빌드 & 태깅
-            docker build -t "${REGISTRY}/${repo_name}:latest" -t "${REGISTRY}/${repo_name}:${IMAGE_TAG}" "${dir}"
+            # 빌드 (-f로 명시)
+            docker build -f "$DOCKERFILE" -t "${REGISTRY}/${repo_name}:latest" -t "${REGISTRY}/${repo_name}:${IMAGE_TAG}" "$dir"
 
             # 푸시
             docker push "${REGISTRY}/${repo_name}:latest"
             docker push "${REGISTRY}/${repo_name}:${IMAGE_TAG}"
-
-            echo "Pushed: ${REGISTRY}/${repo_name}:latest"
-            echo "Pushed: ${REGISTRY}/${repo_name}:${IMAGE_TAG}"
+            echo "Pushed: ${REGISTRY}/${repo_name}:latest, ${REGISTRY}/${repo_name}:${IMAGE_TAG}"
           done
