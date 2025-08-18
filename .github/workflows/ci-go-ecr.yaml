@@ -8,7 +8,7 @@ on:
 
 env:
   AWS_REGION: ap-northeast-2
-  REPOSITORY_PREFIX: backend-service
+  REPO_PREFIX: backend-service
 
 jobs:
   detect-changed:
@@ -16,44 +16,78 @@ jobs:
     outputs:
       folders: ${{ steps.collect.outputs.folders }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 히스토리 전체 (shallow 이슈 방지)
 
-      - name: Collect changed top-level folders
+      - name: Ensure jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Determine base & head
+        id: revs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            # push: 첫 커밋이면 before가 000000..., 아니면 그 sha
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || echo "$BEFORE" | grep -qE '^0+$'; then
+              # 첫 실행 대비: main 직전 커밋이 없으므로 merge-base로 유사 기준 산출
+              git fetch origin main || true
+              BASE=$(git rev-list --max-parents=0 HEAD | tail -n1)
+            else
+              BASE="$BEFORE"
+            fi
+            HEAD="${{ github.sha }}"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD" >> "$GITHUB_OUTPUT"
+
+      - name: Collect changed top-level folders (with fallback)
         id: collect
         shell: bash
         run: |
           set -euo pipefail
-          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before }}"
-          HEAD_SHA="${{ github.sha }}"
-          git fetch --no-tags --depth=100 origin ${{ github.ref }} || true
-          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || true)
+          BASE="${{ steps.revs.outputs.base }}"
+          HEAD="${{ steps.revs.outputs.head }}"
+          git diff --name-only "$BASE" "$HEAD" > /tmp/changed || true
 
-          ROOTS=$(printf "%s\n" "$CHANGED" \
-            | awk -F/ 'NF>=2 {print $1}' \
-            | grep -Ev '^\.(git|github|vscode)$' \
-            | sort -u || true)
+          # 1뎁스 폴더 후보
+          mapfile -t CANDIDATES < <(awk -F/ 'NF>=2 {print $1}' /tmp/changed \
+            | grep -Ev '^\.(git|github|vscode)$' | sort -u)
 
+          # Dockerfile 있는 폴더만
           FILTERED=()
-          for f in $ROOTS; do
+          for f in "${CANDIDATES[@]}"; do
             [ -f "$f/Dockerfile" ] && FILTERED+=("$f")
           done
 
+          # 폴백: 변경 폴더가 0개면, 레포 루트의 Dockerfile 가진 모든 1뎁스 폴더
+          if [ ${#FILTERED[@]} -eq 0 ]; then
+            mapfile -t FILTERED < <(find . -maxdepth 2 -mindepth 2 -name Dockerfile -printf '%h\n' \
+              | awk -F/ '{print $2}' | grep -Ev '^\.(git|github|vscode)$' | sort -u)
+          fi
+
+          # 여전히 없으면 빈 배열
           if [ ${#FILTERED[@]} -eq 0 ]; then
             JSON="[]"
           else
             JSON=$(printf '%s\n' "${FILTERED[@]}" | jq -R -s -c 'split("\n")|map(select(length>0))')
           fi
+
           echo "folders=$JSON" >> "$GITHUB_OUTPUT"
+          echo "Resolved folders: $JSON"
 
   build-and-push:
     needs: detect-changed
-    if: ${{ needs.detect-changed.outputs.folders != '[]' }}
     runs-on: ubuntu-24.04-arm
     strategy:
       matrix:
         service: ${{ fromJson(needs.detect-changed.outputs.folders) }}
-
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
@@ -68,9 +102,9 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Ensure ECR repo exists (backend-service/<folder>)
+      - name: Ensure ECR repo exists (prefix + folder)
         env:
-          REPO: ${{ env.REPOSITORY_PREFIX }}/${{ matrix.service }}
+          REPO: ${{ env.REPO_PREFIX }}/${{ matrix.service }}
         run: |
           set -e
           aws ecr describe-repositories --repository-names "$REPO" --region ${{ env.AWS_REGION }} >/dev/null 2>&1 \
@@ -80,9 +114,9 @@ jobs:
         id: tag
         run: echo "ts=$(date -u +'%Y%m%dT%H%M%SZ')" >> "$GITHUB_OUTPUT"
 
-      - name: Build & Push (prefix + folder)
+      - name: Build & Push
         env:
-          REPO: ${{ env.REPOSITORY_PREFIX }}/${{ matrix.service }}
+          REPO: ${{ env.REPO_PREFIX }}/${{ matrix.service }}
         uses: docker/build-push-action@v6
         with:
           context: ./${{ matrix.service }}
@@ -93,12 +127,3 @@ jobs:
             ${{ steps.ecr.outputs.registry }}/${{ env.REPO }}:${{ steps.tag.outputs.ts }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Verify pushed image (optional)
-        env:
-          REPO: ${{ env.REPOSITORY_PREFIX }}/${{ matrix.service }}
-        run: |
-          aws ecr batch-get-image \
-            --repository-name "$REPO" \
-            --image-ids imageTag=${{ steps.tag.outputs.ts }} \
-            --query 'images[].imageId.imageTag' --output text
