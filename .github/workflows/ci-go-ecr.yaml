@@ -57,7 +57,7 @@ jobs:
               continue
             fi
 
-            repo_name="${REPO_PREFIX}-${dir}"
+            repo_name="${REPO_PREFIX}/${dir}"
             echo "=== Building folder: $dir (Dockerfile: $DOCKERFILE) -> ECR repo: ${repo_name}"
 
             # 리포 없으면 생성
