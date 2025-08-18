@@ -28,28 +28,27 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push all top-level folders
+      - name: Build & Push all top-level folders (+retag previous latest)
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
         shell: bash
         run: |
           set -euo pipefail
 
-          IMAGE_TAG=$(date -u +"%Y%m%dT%H%M%SZ")
-          echo "IMAGE_TAG=${IMAGE_TAG}"
+          NOW_TS=$(date -u +"%Y%m%dT%H%M%SZ")
+          echo "CURRENT BUILD TAG (now): ${NOW_TS}"
 
-          # 레포 루트의 1-depth 폴더 수집
+          # 루트의 1-depth 폴더 수집
           mapfile -t FOLDERS < <(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n' \
                                   | grep -Ev '^\.(git|github|vscode)$' || true)
           echo "Top-level dirs: ${FOLDERS[*]:-<none>}"
-
           if [ ${#FOLDERS[@]} -eq 0 ]; then
             echo "No top-level folders found. Nothing to do."
             exit 0
           fi
 
           for dir in "${FOLDERS[@]}"; do
-            # Dockerfile 경로 탐색 (대/소문자 모두 허용)
+            # Dockerfile 경로(대/소문자 허용)
             if   [ -f "$dir/Dockerfile" ]; then DOCKERFILE="$dir/Dockerfile"
             elif [ -f "$dir/dockerfile" ]; then DOCKERFILE="$dir/dockerfile"
             else
@@ -57,18 +56,64 @@ jobs:
               continue
             fi
 
-            repo_name="${REPO_PREFIX}/${dir}"
-            echo "=== Building folder: $dir (Dockerfile: $DOCKERFILE) -> ECR repo: ${repo_name}"
+            repo_name="${REPO_PREFIX}-${dir}"
+            echo "=== Processing: $dir (Dockerfile: $DOCKERFILE) -> ECR repo: ${repo_name}"
 
             # 리포 없으면 생성
             aws ecr describe-repositories --repository-names "${repo_name}" --region "${AWS_REGION}" >/dev/null 2>&1 \
               || aws ecr create-repository --repository-name "${repo_name}" --region "${AWS_REGION}"
 
-            # 빌드 (-f로 명시)
-            docker build -f "$DOCKERFILE" -t "${REGISTRY}/${repo_name}:latest" -t "${REGISTRY}/${repo_name}:${IMAGE_TAG}" "$dir"
+            # 1) 이전 latest가 있으면, 그 digest를 '이전푸시시각(UTC)' 태그로 리태깅
+            set +e
+            PREV_DIGEST=$(aws ecr describe-images \
+              --repository-name "${repo_name}" \
+              --image-ids imageTag=latest \
+              --query 'imageDetails[0].imageDigest' \
+              --output text 2>/dev/null)
+            set -e
 
-            # 푸시
+            if [ -n "${PREV_DIGEST:-}" ] && [ "${PREV_DIGEST}" != "None" ]; then
+              # 이전 latest가 실제로 존재할 때만
+              PREV_PUSHED_AT=$(aws ecr describe-images \
+                --repository-name "${repo_name}" \
+                --image-ids imageDigest="${PREV_DIGEST}" \
+                --query 'imageDetails[0].imagePushedAt' \
+                --output text)
+              # ISO8601 → UTC 타임스탬프; 파싱 실패 시 NOW_TS로 폴백
+              if PREV_TS=$(date -u -d "${PREV_PUSHED_AT}" +"%Y%m%dT%H%M%SZ" 2>/dev/null); then
+                true
+              else
+                PREV_TS="${NOW_TS}"
+              fi
+              echo "Previous latest digest: ${PREV_DIGEST} (pushedAt: ${PREV_PUSHED_AT} -> tag: ${PREV_TS})"
+
+              # 이전 latest manifest를 가져와서 새 태그로 put-image
+              PREV_MANIFEST=$(aws ecr batch-get-image \
+                --repository-name "${repo_name}" \
+                --image-ids imageDigest="${PREV_DIGEST}" \
+                --accepted-media-types application/vnd.docker.distribution.manifest.v2+json \
+                --query 'images[0].imageManifest' --output text)
+
+              aws ecr put-image \
+                --repository-name "${repo_name}" \
+                --image-tag "${PREV_TS}" \
+                --image-manifest "${PREV_MANIFEST}" >/dev/null
+
+              echo "Retagged previous latest -> ${repo_name}:${PREV_TS}"
+            else
+              echo "No previous 'latest' found for ${repo_name} (first push?)"
+            fi
+
+            # 2) 새 이미지 빌드 (latest + NOW_TS 두 태그)
+            docker build -f "$DOCKERFILE" \
+              -t "${REGISTRY}/${repo_name}:latest" \
+              -t "${REGISTRY}/${repo_name}:${NOW_TS}" \
+              "$dir"
+
+            # 3) 푸시
             docker push "${REGISTRY}/${repo_name}:latest"
-            docker push "${REGISTRY}/${repo_name}:${IMAGE_TAG}"
-            echo "Pushed: ${REGISTRY}/${repo_name}:latest, ${REGISTRY}/${repo_name}:${IMAGE_TAG}"
+            docker push "${REGISTRY}/${repo_name}:${NOW_TS}"
+
+            echo "Pushed: ${REGISTRY}/${repo_name}:latest"
+            echo "Pushed: ${REGISTRY}/${repo_name}:${NOW_TS}"
           done
