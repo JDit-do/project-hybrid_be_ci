@@ -32,10 +32,8 @@ jobs:
             BASE="${{ github.event.pull_request.base.sha }}"
             HEAD="${{ github.event.pull_request.head.sha }}"
           else
-            # push: 첫 커밋이면 before가 000000..., 아니면 그 sha
             BEFORE="${{ github.event.before }}"
             if [ -z "$BEFORE" ] || echo "$BEFORE" | grep -qE '^0+$'; then
-              # 첫 실행 대비: main 직전 커밋이 없으므로 merge-base로 유사 기준 산출
               git fetch origin main || true
               BASE=$(git rev-list --max-parents=0 HEAD | tail -n1)
             else
@@ -65,13 +63,12 @@ jobs:
             [ -f "$f/Dockerfile" ] && FILTERED+=("$f")
           done
 
-          # 폴백: 변경 폴더가 0개면, 레포 루트의 Dockerfile 가진 모든 1뎁스 폴더
+          # 폴백: 변경 폴더가 0개면, 루트의 Dockerfile 가진 모든 1뎁스 폴더
           if [ ${#FILTERED[@]} -eq 0 ]; then
             mapfile -t FILTERED < <(find . -maxdepth 2 -mindepth 2 -name Dockerfile -printf '%h\n' \
               | awk -F/ '{print $2}' | grep -Ev '^\.(git|github|vscode)$' | sort -u)
           fi
 
-          # 여전히 없으면 빈 배열
           if [ ${#FILTERED[@]} -eq 0 ]; then
             JSON="[]"
           else
@@ -83,11 +80,14 @@ jobs:
 
   build-and-push:
     needs: detect-changed
+    ### CHANGED: 폴더가 없으면 스킵(정상)
+    if: ${{ needs.detect-changed.outputs.folders != '[]' && needs.detect-changed.outputs.folders != '' }}
     runs-on: ubuntu-24.04-arm
     strategy:
       matrix:
         service: ${{ fromJson(needs.detect-changed.outputs.folders) }}
       fail-fast: false
+
     steps:
       - uses: actions/checkout@v4
 
@@ -102,28 +102,34 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      ### CHANGED: 리포 이름을 'backend-service-<폴더명>'으로 생성/검증
       - name: Ensure ECR repo exists (prefix + folder)
         env:
-          REPO: ${{ env.REPO_PREFIX }}/${{ matrix.service }}
+          REPO_NAME: ${{ env.REPO_PREFIX }}-${{ matrix.service }}
         run: |
           set -e
-          aws ecr describe-repositories --repository-names "$REPO" --region ${{ env.AWS_REGION }} >/dev/null 2>&1 \
-          || aws ecr create-repository --repository-name "$REPO" --region ${{ env.AWS_REGION }}
+          aws ecr describe-repositories \
+            --repository-names "$REPO_NAME" \
+            --region ${{ env.AWS_REGION }} >/dev/null 2>&1 \
+          || aws ecr create-repository \
+               --repository-name "$REPO_NAME" \
+               --region ${{ env.AWS_REGION }}
 
       - name: Set timestamp tag
         id: tag
         run: echo "ts=$(date -u +'%Y%m%dT%H%M%SZ')" >> "$GITHUB_OUTPUT"
 
+      ### CHANGED: 푸시 대상도 'backend-service-<폴더명>'
       - name: Build & Push
         env:
-          REPO: ${{ env.REPO_PREFIX }}/${{ matrix.service }}
+          REPO_NAME: ${{ env.REPO_PREFIX }}-${{ matrix.service }}
         uses: docker/build-push-action@v6
         with:
           context: ./${{ matrix.service }}
           file: ./${{ matrix.service }}/Dockerfile
           push: true
           tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ env.REPO }}:latest
-            ${{ steps.ecr.outputs.registry }}/${{ env.REPO }}:${{ steps.tag.outputs.ts }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.REPO_NAME }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ env.REPO_NAME }}:${{ steps.tag.outputs.ts }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
