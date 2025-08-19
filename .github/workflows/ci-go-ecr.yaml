@@ -34,11 +34,9 @@ jobs:
       - name: Build & Push all top-level folders
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          # workflow_dispatch로 수동 실행 시, 'minor' 입력을 받을 수 있게 추가.
-          # GitHub UI에서 입력 받아 'on.workflow_dispatch.inputs.minor'를 정의.
           INPUT_MINOR: ${{ github.event.inputs.minor }} # 비어있으면 자동
           DEFAULT_MAJOR: "1"
-          ALLOW_CREATE: "true"
+          ALLOW_CREATE: "true" # 없으면 생성 허용; 금지하려면 "false"
         shell: bash
         run: |
           set -euo pipefail
@@ -46,7 +44,7 @@ jobs:
           NOW_TS=$(date -u +"%Y%m%dT%H%M%SZ")
           echo "CURRENT UTC: ${NOW_TS}"
 
-          # 루트의 1-depth 폴더 수집
+          # 1-depth 폴더 수집
           mapfile -t FOLDERS < <(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n' \
                                   | grep -Ev '^\.(git|github|vscode)$' || true)
           echo "Top-level dirs: ${FOLDERS[*]:-<none>}"
@@ -55,34 +53,32 @@ jobs:
             exit 0
           fi
 
-          ensure_repo() {
+          require_repo() {
             local repo="$1"
-            # 존재하면 OK
+            
+            # 존재하면 통과
             if aws ecr describe-repositories --repository-names "$repo" --region "${AWS_REGION}" >/dev/null 2>&1; then
               echo "ECR repo exists: $repo"
               return 0
             fi
-            # 존재하지 않고 생성 금지면 스킵
+            
+            # 생성 비허용이면 실패 처리
             if [ "${ALLOW_CREATE}" != "true" ]; then
-              echo "ECR repo missing and creation disabled: $repo (skip build)"
+              echo "ERROR: ECR repo not found and creation disabled: $repo"
               return 1
             fi
-            # 생성 시도 (권한 없거나 이미 경쟁 생성이면 에러 무시)
+            
+            # 생성 시도
             echo "Creating ECR repo: $repo"
-            if ! aws ecr create-repository --repository-name "$repo" --region "${AWS_REGION}" >/dev/null 2>&1; then
-              # 두 경우를 허용:
-              # - RepositoryAlreadyExistsException (경쟁 생성)
-              # - AccessDeniedException (권한 없음) → 스킵
-              if aws ecr describe-repositories --repository-names "$repo" --region "${AWS_REGION}" >/dev/null 2>&1; then
-                echo "Repo became available after create attempt: $repo"
-                return 0
-              else
-                echo "WARN: cannot create or find repo: $repo (likely missing ecr:CreateRepository permission). Skip."
-                return 1
-              fi
+            aws ecr create-repository --repository-name "$repo" --region "${AWS_REGION}" >/dev/null 2>&1 || true
+            
+            # 생성/경쟁/권한 이슈 상관없이 최종 재확인
+            if aws ecr describe-repositories --repository-names "$repo" --region "${AWS_REGION}" >/dev/null 2>&1; then
+              echo "ECR repo ready: $repo"
+              return 0
             fi
-            echo "Created ECR repo: $repo"
-            return 0
+            echo "ERROR: Cannot ensure ECR repo: $repo (missing permission or invalid name)."
+            return 1
           }
 
           for dir in "${FOLDERS[@]}"; do
@@ -97,13 +93,8 @@ jobs:
             repo_name="${REPO_PREFIX}/${dir}"  # 예: backend-service/testgo
             echo "=== Processing: $dir (Dockerfile: $DOCKERFILE) -> ECR repo: ${repo_name}"
 
-            # 0) 리포 확인/생성(필요 시)
-            if ! ensure_repo "$repo_name"; then
-              echo "Skip $dir due to repo readiness failure."
-              continue
-            fi
-
-            # 1) 기존 semver 태그 모으기 (vX.Y.Z)
+            # ── A) 항상 빌드 (레포 상태와 무관)
+            # 기존 semver 태그 수집 (vX.Y.Z)
             EXISTING=$(
               aws ecr describe-images \
                 --repository-name "${repo_name}" \
@@ -111,8 +102,8 @@ jobs:
                 --output text 2>/dev/null | tr '\t' '\n' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
             )
 
-            # 2) major/minor 결정 - MINOR 입력이 없으면 "현재 리포의 최신 MINOR 유지"
             MAJOR="${DEFAULT_MAJOR}"
+            # MINOR: 입력 없으면 최신 MINOR 유지
             if [ -n "${INPUT_MINOR:-}" ]; then
               [[ "${INPUT_MINOR}" =~ ^[0-9]+$ ]] || { echo "Invalid INPUT_MINOR='${INPUT_MINOR}'"; exit 1; }
               MINOR="${INPUT_MINOR}"
@@ -126,33 +117,29 @@ jobs:
                 MINOR="0"
               fi
             fi
-
-            # 3) PATCH: Push할때마다 patch +1
+            # PATCH: 해당 MINOR의 최신 +1 (기본 Z만 증가)
             if [ -n "${EXISTING}" ]; then
               PATCH_MAX=$(printf '%s\n' ${EXISTING} \
                 | awk -F'[v\\.]' -v maj="${MAJOR}" -v min="${MINOR}" '$2==maj && $3==min {print $4}' \
                 | sort -n | tail -n1)
-              if [ -z "${PATCH_MAX:-}" ]; then
-                # 해당 MINOR가 처음 등장 → 0부터 시작
-                PATCH="0"
-              else
-                PATCH=$((PATCH_MAX + 1))
-              fi
+              PATCH=$([ -z "${PATCH_MAX:-}" ] && echo 0 || echo $((PATCH_MAX + 1)))
             else
               PATCH="0"
             fi
             VERSION_TAG="v${MAJOR}.${MINOR}.${PATCH}"
             echo "Resolved version for ${repo_name}: ${VERSION_TAG}"
 
-            # 4) 빌드 & 태깅
+            # 도커 빌드
             docker build -f "$DOCKERFILE" \
               -t "${REGISTRY}/${repo_name}:latest" \
               -t "${REGISTRY}/${repo_name}:${VERSION_TAG}" \
               "$dir"
 
-            # 5) 푸시
+            # ── B) 푸시 전에 레포를 '반드시' 보장. 실패 시 잡 실패로 종료.
+            require_repo "$repo_name" || exit 1
+
+            # 푸시
             docker push "${REGISTRY}/${repo_name}:${VERSION_TAG}"
             docker push "${REGISTRY}/${repo_name}:latest"
-
             echo "Pushed: ${REGISTRY}/${repo_name}:${VERSION_TAG} and :latest"
           done
