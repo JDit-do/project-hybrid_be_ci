@@ -28,15 +28,19 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push all top-level folders (+retag previous latest)
+      - name: Build & Push all top-level folders
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
+          # workflow_dispatch로 수동 실행 시, 'minor' 입력을 받을 수 있게 추가해도 됨.
+          # GitHub UI에서 입력을 받으려면 'on.workflow_dispatch.inputs.minor'를 정의하세요.
+          INPUT_MINOR: ${{ github.event.inputs.minor }} # 비어있으면 자동
+          DEFAULT_MAJOR: "1"
         shell: bash
         run: |
           set -euo pipefail
 
           NOW_TS=$(date -u +"%Y%m%dT%H%M%SZ")
-          echo "CURRENT BUILD TAG (now): ${NOW_TS}"
+          echo "CURRENT UTC: ${NOW_TS}"
 
           # 루트의 1-depth 폴더 수집
           mapfile -t FOLDERS < <(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n' \
@@ -56,64 +60,71 @@ jobs:
               continue
             fi
 
-            repo_name="${REPO_PREFIX}-${dir}"
+            repo_name="${REPO_PREFIX}/${dir}"
             echo "=== Processing: $dir (Dockerfile: $DOCKERFILE) -> ECR repo: ${repo_name}"
 
-            # 리포 없으면 생성
+            # ECR 리포 없으면 생성
             aws ecr describe-repositories --repository-names "${repo_name}" --region "${AWS_REGION}" >/dev/null 2>&1 \
               || aws ecr create-repository --repository-name "${repo_name}" --region "${AWS_REGION}"
 
-            # 1) 이전 latest가 있으면, 그 digest를 '이전푸시시각(UTC)' 태그로 리태깅
-            set +e
-            PREV_DIGEST=$(aws ecr describe-images \
-              --repository-name "${repo_name}" \
-              --image-ids imageTag=latest \
-              --query 'imageDetails[0].imageDigest' \
-              --output text 2>/dev/null)
-            set -e
-
-            if [ -n "${PREV_DIGEST:-}" ] && [ "${PREV_DIGEST}" != "None" ]; then
-              # 이전 latest가 실제로 존재할 때만
-              PREV_PUSHED_AT=$(aws ecr describe-images \
+            # ── 1) 현재 리포의 기존 semver 태그들 가져오기 (vX.Y.Z만)
+            # describe-images는 페이지가 있을 수 있으니 --query로 평탄화
+            EXISTING=$(
+              aws ecr describe-images \
                 --repository-name "${repo_name}" \
-                --image-ids imageDigest="${PREV_DIGEST}" \
-                --query 'imageDetails[0].imagePushedAt' \
-                --output text)
-              # ISO8601 → UTC 타임스탬프; 파싱 실패 시 NOW_TS로 폴백
-              if PREV_TS=$(date -u -d "${PREV_PUSHED_AT}" +"%Y%m%dT%H%M%SZ" 2>/dev/null); then
-                true
-              else
-                PREV_TS="${NOW_TS}"
+                --query "imageDetails[].imageTags[]" \
+                --output text 2>/dev/null | tr '\t' '\n' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
+            )
+
+            # ── 2) major/minor 결정
+            MAJOR="${DEFAULT_MAJOR}"
+            if [ -n "${INPUT_MINOR:-}" ]; then
+              # 사용자가 minor를 지정한 경우 (예: 7)
+              if ! [[ "${INPUT_MINOR}" =~ ^[0-9]+$ ]]; then
+                echo "Invalid INPUT_MINOR='${INPUT_MINOR}'. Must be integer." >&2
+                exit 1
               fi
-              echo "Previous latest digest: ${PREV_DIGEST} (pushedAt: ${PREV_PUSHED_AT} -> tag: ${PREV_TS})"
-
-              # 이전 latest manifest를 가져와서 새 태그로 put-image
-              PREV_MANIFEST=$(aws ecr batch-get-image \
-                --repository-name "${repo_name}" \
-                --image-ids imageDigest="${PREV_DIGEST}" \
-                --accepted-media-types application/vnd.docker.distribution.manifest.v2+json \
-                --query 'images[0].imageManifest' --output text)
-
-              aws ecr put-image \
-                --repository-name "${repo_name}" \
-                --image-tag "${PREV_TS}" \
-                --image-manifest "${PREV_MANIFEST}" >/dev/null
-
-              echo "Retagged previous latest -> ${repo_name}:${PREV_TS}"
+              MINOR="${INPUT_MINOR}"
             else
-              echo "No previous 'latest' found for ${repo_name} (first push?)"
+              # 기존 태그에서 가장 큰 minor 찾기 (해당 major 기준)
+              if [ -n "${EXISTING}" ]; then
+                MINOR=$(printf '%s\n' ${EXISTING} \
+                  | awk -F'[v\\.]' -v maj="${MAJOR}" '$2==maj {print $3}' \
+                  | sort -n | tail -n1)
+                if [ -z "${MINOR:-}" ]; then
+                  MINOR="0"
+                fi
+              else
+                MINOR="0"
+              fi
             fi
 
-            # 2) 새 이미지 빌드 (latest + NOW_TS 두 태그)
+            # ── 3) patch 계산: 해당 major.minor에서 가장 큰 patch + 1
+            if [ -n "${EXISTING}" ]; then
+              PATCH_MAX=$(printf '%s\n' ${EXISTING} \
+                | awk -F'[v\\.]' -v maj="${MAJOR}" -v min="${MINOR}" '$2==maj && $3==min {print $4}' \
+                | sort -n | tail -n1)
+              if [ -z "${PATCH_MAX:-}" ]; then
+                PATCH="0"
+              else
+                PATCH=$((PATCH_MAX + 1))
+              fi
+            else
+              PATCH="0"
+            fi
+
+            VERSION_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            echo "Resolved version for ${repo_name}: ${VERSION_TAG}"
+
+            # ── 4) 도커 빌드 (latest + semver)
             docker build -f "$DOCKERFILE" \
               -t "${REGISTRY}/${repo_name}:latest" \
-              -t "${REGISTRY}/${repo_name}:${NOW_TS}" \
+              -t "${REGISTRY}/${repo_name}:${VERSION_TAG}" \
               "$dir"
 
-            # 3) 푸시
+            # ── 5) 푸시
+            docker push "${REGISTRY}/${repo_name}:${VERSION_TAG}"
             docker push "${REGISTRY}/${repo_name}:latest"
-            docker push "${REGISTRY}/${repo_name}:${NOW_TS}"
 
-            echo "Pushed: ${REGISTRY}/${repo_name}:latest"
-            echo "Pushed: ${REGISTRY}/${repo_name}:${NOW_TS}"
+            echo "Pushed: ${REGISTRY}/${repo_name}:${VERSION_TAG} and :latest"
           done
