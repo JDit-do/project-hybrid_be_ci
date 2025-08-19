@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       bump_minor:
-        description: "다음 Minor로 올리겠습니까? (true면 minor+1, 아니면 patch+1)"
+        description: "Minor를 올리겠습니까? (true면 minor+1, 아니면 patch+1)"
         required: false
         type: boolean
         default: false
