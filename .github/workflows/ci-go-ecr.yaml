@@ -7,8 +7,8 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      minor:
-        description: "다음 마이너로 올릴까요? (true면 minor+1, 아니면 patch+1)"
+      bump_minor:
+        description: "다음 Minor로 올리겠습니까? (true면 minor+1, 아니면 patch+1)"
         required: false
         type: boolean
         default: false
@@ -24,7 +24,6 @@ env:
 jobs:
   build-all:
     runs-on: ubuntu-24.04-arm
-
     steps:
       - uses: actions/checkout@v4
 
@@ -42,12 +41,14 @@ jobs:
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           DEFAULT_MAJOR: "1"
-          ALLOW_CREATE: "true" # Repository 생성 여부(true, false)
+          ALLOW_CREATE: "true"
         shell: bash
         run: |
           set -euo pipefail
 
+          # 수동 실행 boolean 입력 (push/PR이면 빈 문자열)
           INPUT_BUMP_MINOR="${{ github.event.inputs.bump_minor }}"
+
           NOW_TS=$(date -u +"%Y%m%dT%H%M%SZ")
           echo "CURRENT UTC: ${NOW_TS}"
 
@@ -62,24 +63,16 @@ jobs:
 
           require_repo() {
             local repo="$1"
-            
-            # 존재하면 통과
             if aws ecr describe-repositories --repository-names "$repo" --region "${AWS_REGION}" >/dev/null 2>&1; then
               echo "ECR repo exists: $repo"
               return 0
             fi
-            
-            # 생성 비허용이면 실패 처리
             if [ "${ALLOW_CREATE}" != "true" ]; then
               echo "ERROR: ECR repo not found and creation disabled: $repo"
               return 1
             fi
-            
-            # 생성 시도
             echo "Creating ECR repo: $repo"
             aws ecr create-repository --repository-name "$repo" --region "${AWS_REGION}" >/dev/null 2>&1 || true
-            
-            # 생성/경쟁/권한 이슈 상관없이 최종 재확인
             if aws ecr describe-repositories --repository-names "$repo" --region "${AWS_REGION}" >/dev/null 2>&1; then
               echo "ECR repo ready: $repo"
               return 0
@@ -100,7 +93,6 @@ jobs:
             repo_name="${REPO_PREFIX}/${dir}"
             echo "=== Processing: $dir (Dockerfile: $DOCKERFILE) -> ECR repo: ${repo_name}"
 
-            # ── A) 항상 빌드 (레포 상태와 무관)
             # 기존 semver 태그 수집 (vX.Y.Z)
             EXISTING=$(
               aws ecr describe-images \
@@ -110,13 +102,6 @@ jobs:
             )
 
             MAJOR="${DEFAULT_MAJOR}"
-            # 현재 repo의 최대 MINOR 계산
-            EXISTING=$(
-              aws ecr describe-images \
-                --repository-name "${repo_name}" \
-                --query "imageDetails[].imageTags[]" \
-                --output text 2>/dev/null | tr '\t' '\n' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
-            )
 
             # 현재 repo의 최대 MINOR 계산
             if [ -n "${EXISTING}" ]; then
@@ -132,12 +117,12 @@ jobs:
             BUMP=$(echo "${INPUT_BUMP_MINOR:-}" | tr '[:upper:]' '[:lower:]')
 
             if [ "${BUMP}" = "true" ]; then
-              # 마이너 1단계 올림, 패치는 0으로 초기화
+              # 마이너 +1, 패치 0 초기화
               MINOR=$(( CUR_MINOR_MAX + 1 ))
               PATCH="0"
               BUMP_KIND="minor(+1)"
             else
-              # ↔ 기존처럼 현재 마이너에서 패치만 +1
+              # ↔ 현재 마이너에서 패치만 +1
               MINOR="${CUR_MINOR_MAX}"
               if [ -n "${EXISTING}" ]; then
                 PATCH_MAX=$(printf '%s\n' ${EXISTING} \
@@ -153,4 +138,18 @@ jobs:
             VERSION_TAG="v${MAJOR}.${MINOR}.${PATCH}"
             echo "::notice:: [${repo_name}] bump=${BUMP_KIND} -> ${VERSION_TAG}"
             echo "Resolved version for ${repo_name}: ${VERSION_TAG}"
+
+            # 도커 빌드
+            docker build -f "$DOCKERFILE" \
+              -t "${REGISTRY}/${repo_name}:latest" \
+              -t "${REGISTRY}/${repo_name}:${VERSION_TAG}" \
+              "$dir"
+
+            # 푸시 전 레포 보장
+            require_repo "$repo_name" || exit 1
+
+            # 푸시
+            docker push "${REGISTRY}/${repo_name}:${VERSION_TAG}"
+            docker push "${REGISTRY}/${repo_name}:latest"
+            echo "Pushed: ${REGISTRY}/${repo_name}:${VERSION_TAG} and :latest"
           done
