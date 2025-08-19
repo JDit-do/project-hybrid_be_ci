@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  id-token: write
+  contents: read
+
 env:
   AWS_REGION: ap-northeast-2
   REPO_PREFIX: backend-service
@@ -17,12 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-oidc-ecr-pusher
           aws-region: ${{ env.AWS_REGION }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Login to Amazon ECR
         id: ecr
@@ -31,8 +34,8 @@ jobs:
       - name: Build & Push all top-level folders
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          # workflow_dispatch로 수동 실행 시, 'minor' 입력을 받을 수 있게 추가해도 됨.
-          # GitHub UI에서 입력을 받으려면 'on.workflow_dispatch.inputs.minor'를 정의하세요.
+          # workflow_dispatch로 수동 실행 시, 'minor' 입력을 받을 수 있게 추가.
+          # GitHub UI에서 입력 받아 'on.workflow_dispatch.inputs.minor'를 정의.
           INPUT_MINOR: ${{ github.event.inputs.minor }} # 비어있으면 자동
           DEFAULT_MAJOR: "1"
         shell: bash
