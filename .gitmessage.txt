@@ -1,4 +1,4 @@
-########## 예시 ########## - 사용시 해당 라인 삭제
+########## 예시 ########## - 예시에서 주석만 지우고 작성하셔도 괜찮습니다.
 # feat(api): 리프레시 토큰 로테이션 추가
 
 # - 변경 이유, 상세 내용, 이슈 배경
@@ -9,6 +9,7 @@
 
 
 ########## Commit message template ########## - 참조
+# Git commit message 설정 방법은 README.md
 ##### 제목
 # <type>(<scope>): <subject>의 형식으로 제목 구성
 #  - type: feat | fix | docs | test | refactor | style | chore | ci
@@ -33,7 +34,3 @@
 ##### 꼬리말
 # BREAKING CHANGE: (Option) 변경으로 인한 주의사항
 # Refs: 커밋과 관련된 이슈 번호(#123, #456)
-
-
-
-
