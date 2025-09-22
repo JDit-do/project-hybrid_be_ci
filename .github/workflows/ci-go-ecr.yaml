@@ -52,12 +52,39 @@ jobs:
           NOW_TS=$(date -u +"%Y%m%dT%H%M%SZ")
           echo "CURRENT UTC: ${NOW_TS}"
 
-          # 1-depth 폴더 수집
-          mapfile -t FOLDERS < <(find . -maxdepth 1 -mindepth 1 -type d -printf '%P\n' \
-                                  | grep -Ev '^\.(git|github|vscode)$' || true)
-          echo "Top-level dirs: ${FOLDERS[*]:-<none>}"
-          if [ ${#FOLDERS[@]} -eq 0 ]; then
-            echo "No top-level folders found. Nothing to do."
+          # 루트(1-depth)에 위치한 공용 Dockerfile 확인
+          if   [ -f "./Dockerfile" ]; then ROOT_DOCKERFILE="./Dockerfile"
+          elif [ -f "./dockerfile" ]; then ROOT_DOCKERFILE="./dockerfile"
+          else
+            echo "No top-level Dockerfile found. Nothing to do."
+            exit 0
+          fi
+
+          echo "Using root Dockerfile: ${ROOT_DOCKERFILE}"
+
+          # 새로운 디렉토리 구조: (A) 큰기능/특정기능/코드 (3-depth)
+          #                    (B) 큰기능/서비스분류/특정기능/코드 (4-depth)
+          # 숨김 디렉토리(., .github, 등) 제외
+          mapfile -t CANDIDATE_DIRS < <( { \
+              find . -mindepth 3 -maxdepth 3 -type d -printf '%P\n'; \
+              find . -mindepth 4 -maxdepth 4 -type d -printf '%P\n'; \
+            } | grep -Ev '(^|/)\.' | sort -u || true )
+          echo "3/4-depth dirs: ${CANDIDATE_DIRS[*]:-<none>}"
+          if [ ${#CANDIDATE_DIRS[@]} -eq 0 ]; then
+            echo "No 3/4-depth directories found. Nothing to do."
+            exit 0
+          fi
+
+          # Go 프로젝트만 대상으로 필터링 (main.go, go.mod, go.sum 동시 존재)
+          GO_TARGETS=()
+          for d in "${CANDIDATE_DIRS[@]}"; do
+            if [ -f "$d/main.go" ] && [ -f "$d/go.mod" ] && [ -f "$d/go.sum" ]; then
+              GO_TARGETS+=("$d")
+            fi
+          done
+          echo "Go build targets: ${GO_TARGETS[*]:-<none>}"
+          if [ ${#GO_TARGETS[@]} -eq 0 ]; then
+            echo "No Go targets found (Python or other types present). Nothing to do."
             exit 0
           fi
 
@@ -81,17 +108,9 @@ jobs:
             return 1
           }
 
-          for dir in "${FOLDERS[@]}"; do
-            # Dockerfile 경로(대/소문자 허용)
-            if   [ -f "$dir/Dockerfile" ]; then DOCKERFILE="$dir/Dockerfile"
-            elif [ -f "$dir/dockerfile" ]; then DOCKERFILE="$dir/dockerfile"
-            else
-              echo "Skip $dir (no Dockerfile/dockerfile)"
-              continue
-            fi
-
+          for dir in "${GO_TARGETS[@]}"; do
             repo_name="${REPO_PREFIX}/${dir}"
-            echo "=== Processing: $dir (Dockerfile: $DOCKERFILE) -> ECR repo: ${repo_name}"
+            echo "=== Processing: $dir (Dockerfile: ${ROOT_DOCKERFILE}) -> ECR repo: ${repo_name}"
 
             # 기존 semver 태그 수집 (vX.Y.Z)
             EXISTING=$(
@@ -140,7 +159,7 @@ jobs:
             echo "Resolved version for ${repo_name}: ${VERSION_TAG}"
 
             # 도커 빌드
-            docker build -f "$DOCKERFILE" \
+            docker build -f "${ROOT_DOCKERFILE}" \
               -t "${REGISTRY}/${repo_name}:latest" \
               -t "${REGISTRY}/${repo_name}:${VERSION_TAG}" \
               "$dir"
