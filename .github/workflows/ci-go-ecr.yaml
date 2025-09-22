@@ -3,6 +3,9 @@ name: CI on ECR
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
     inputs:
       bump_minor:
         description: "Minor를 올리겠습니까? (true면 minor+1, 아니면 patch+1)"
@@ -20,7 +23,7 @@ env:
 
 jobs:
   build-all:
-    if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
+    if: (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main') || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -46,8 +49,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 수동 실행 boolean 입력 (push/PR이면 빈 문자열)
-          INPUT_BUMP_MINOR="${{ github.event.inputs.bump_minor }}"
+          # 버전 증가 정책: (1) 수동 실행일 때 입력 bump_minor 우선, (2) 그 외 [minor] 키워드
 
           NOW_TS=$(date -u +"%Y%m%dT%H%M%SZ")
           echo "CURRENT UTC: ${NOW_TS}"
@@ -61,6 +63,7 @@ jobs:
           fi
 
           echo "Using root Dockerfile: ${ROOT_DOCKERFILE}"
+
 
           # 새로운 디렉토리 구조: (A) 큰기능/특정기능/코드 (3-depth)
           #                    (B) 큰기능/서비스분류/특정기능/코드 (4-depth)
@@ -179,8 +182,25 @@ jobs:
               CUR_MINOR_MAX="0"
             fi
 
-            # 입력값은 문자열("true"/"false")이므로 소문자로 정규화
-            BUMP=$(echo "${INPUT_BUMP_MINOR:-}" | tr '[:upper:]' '[:lower:]')
+            # bump_minor 입력값 (수동 실행 시에만 존재)
+            INPUT_BUMP="${{ github.event.inputs.bump_minor || '' }}"
+            BUMP="false"
+            if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+              if echo "${INPUT_BUMP}" | grep -qi '^true$'; then
+                BUMP="true"
+              fi
+            else
+              # 커밋 메시지/PR 제목/본문에 [minor] 포함 시 minor 증가
+              if [ "${EVENT_NAME}" = "pull_request" ]; then
+                PR_TITLE='${{ github.event.pull_request.title }}'
+                PR_BODY='${{ github.event.pull_request.body }}'
+                if echo "$PR_TITLE" | grep -qi '\[minor\]'; then BUMP="true"; fi
+                if echo "$PR_BODY" | grep -qi '\[minor\]'; then BUMP="true"; fi
+              else
+                LAST_COMMIT_MSG=$(git log -1 --pretty=%B || true)
+                if echo "$LAST_COMMIT_MSG" | grep -qi '\[minor\]'; then BUMP="true"; fi
+              fi
+            fi
 
             if [ "${BUMP}" = "true" ]; then
               # 마이너 +1, 패치 0 초기화
@@ -210,6 +230,7 @@ jobs:
               -t "${REGISTRY}/${repo_name}:latest" \
               -t "${REGISTRY}/${repo_name}:${VERSION_TAG}" \
               "$dir"
+
 
             # 푸시 전 레포 보장
             require_repo "$repo_name" || exit 1
