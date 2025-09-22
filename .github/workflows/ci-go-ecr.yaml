@@ -26,6 +26,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -88,6 +90,53 @@ jobs:
             exit 0
           fi
 
+          # 변경 파일 기반 선별 빌드 (PR/Push 기준으로 변경된 디렉토리만 빌드)
+          EVENT_NAME="${{ github.event_name }}"
+          REFRESH_ALL=false
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            REFRESH_ALL=true
+          fi
+
+          BASE_SHA=""
+          HEAD_SHA="${{ github.sha }}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+
+          CHANGED_FILES=""
+          if [ -n "$BASE_SHA" ]; then
+            CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || true)
+          fi
+          echo "Changed files between $BASE_SHA..$HEAD_SHA:"$'\n'"${CHANGED_FILES:-<none>}"
+
+          # 루트 Dockerfile이 변경되면 전체 리빌드
+          DF_REL="${ROOT_DOCKERFILE#./}"
+          if echo "$CHANGED_FILES" | grep -Fxq "$DF_REL"; then
+            echo "Root Dockerfile changed -> rebuild all Go targets"
+            REFRESH_ALL=true
+          fi
+
+          SELECTED_TARGETS=()
+          if [ "$REFRESH_ALL" = "true" ]; then
+            SELECTED_TARGETS=("${GO_TARGETS[@]}")
+          else
+            for d in "${GO_TARGETS[@]}"; do
+              if echo "$CHANGED_FILES" | grep -E "^${d}/" >/dev/null 2>&1; then
+                SELECTED_TARGETS+=("$d")
+              fi
+            done
+          fi
+
+          echo "Selected targets: ${SELECTED_TARGETS[*]:-<none>}"
+          if [ ${#SELECTED_TARGETS[@]} -eq 0 ]; then
+            echo "No changed Go targets to build. Nothing to do."
+            exit 0
+          fi
+
           require_repo() {
             local repo="$1"
             if aws ecr describe-repositories --repository-names "$repo" --region "${AWS_REGION}" >/dev/null 2>&1; then
@@ -108,7 +157,7 @@ jobs:
             return 1
           }
 
-          for dir in "${GO_TARGETS[@]}"; do
+          for dir in "${SELECTED_TARGETS[@]}"; do
             repo_name="${REPO_PREFIX}/${dir}"
             echo "=== Processing: $dir (Dockerfile: ${ROOT_DOCKERFILE}) -> ECR repo: ${repo_name}"
 
